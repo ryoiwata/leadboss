@@ -1,0 +1,26 @@
+# docker-compose.ingest.yaml
+version: "3.9"
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ACCESS_KEY: bossort
+      MINIO_SECRET_KEY: bossort123
+    volumes:
+      - ./minio-data:/data
+    ports: ["9000:9000", "9001:9001"]
+
+  ingest:
+    build:
+      context: .
+      dockerfile: docker/dev.Dockerfile
+    volumes:
+      - ./flows:/app/flows              # your Prefect code
+      - ./raw_zone:/raw_zone            # local landing zone (bind mount)
+    environment:
+      RAW_ZONE: /raw_zone
+      # comment these three lines if you stay purely local
+      S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: bossort
+      AWS_SECRET_ACCESS_KEY: bossort123

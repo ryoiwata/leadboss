@@ -1,0 +1,6 @@
+# requirements_ingest.txt
+prefect==2.*
+allensdk>=2.15      # for EcephysProjectCache
+dandi>=0.69         # DANDI CLI + REST   :contentReference[oaicite:0]{index=0}
+pynwb
+boto3               # if you point at a MinIO/S3 bucket
