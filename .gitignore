@@ -1,7 +1,7 @@
 # Environments
-/envs
-/data
-/old
+envs/
+data/
+old/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

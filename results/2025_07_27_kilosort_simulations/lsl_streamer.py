@@ -1,4 +1,6 @@
 import numpy as np
+from scipy import signal
+from collections import deque
 import struct
 import json
 from pathlib import Path
@@ -6,10 +8,167 @@ import time
 from pylsl import StreamInfo, StreamOutlet
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from collections import deque
 import threading
 import queue
 
+class FixedPoint:
+    """Fixed-point arithmetic implementation for low-power processing"""
+    
+    @staticmethod
+    def to_fixed(value, integer_bits, fractional_bits):
+        """Convert floating point to fixed point representation"""
+        scale = 1 << fractional_bits
+        return int(value * scale)
+    
+    @staticmethod
+    def from_fixed(value, integer_bits, fractional_bits):
+        """Convert fixed point to floating point"""
+        scale = 1 << fractional_bits
+        return value / scale
+    
+    @staticmethod
+    def multiply_fixed(a, b, result_format):
+        """Multiply two fixed point numbers"""
+        # Simplified multiplication - in real implementation would handle overflow
+        return a * b >> result_format['shift']
+
+class PreprocessingPipeline:
+    """Real-time preprocessing pipeline based on patent specifications"""
+    
+    def __init__(self, sample_rate=30000, n_channels=32, use_fixed_point=False):
+        self.sample_rate = sample_rate
+        self.n_channels = n_channels
+        self.use_fixed_point = use_fixed_point
+        
+        # 1. Amplification parameters
+        self.amplification_gain = 1.0  # Adjust based on your hardware
+        
+        # 2. Bandpass filter design (500Hz - 5kHz)
+        self.bp_low = 500
+        self.bp_high = 5000
+        self.filter_order = 2  # 2nd order Butterworth as per patent
+        
+        # Design IIR Butterworth filter
+        self.sos = signal.butter(self.filter_order, 
+                                [self.bp_low, self.bp_high], 
+                                btype='band', 
+                                fs=sample_rate, 
+                                output='sos')
+        
+        # Initialize filter states for each channel
+        self.zi = np.zeros((n_channels, self.sos.shape[0], 2))
+        
+        # 3. MAD calculation parameters
+        self.alpha = 0.001  # Update rate for MAD (α in patent)
+        self.beta = 4.0     # Threshold multiplier (β in patent)
+        
+        # MAD buffers for each channel
+        self.mad_estimates = np.zeros(n_channels)
+        self.thresholds = np.zeros(n_channels)
+        
+        # Initialize MAD with reasonable defaults
+        self.mad_estimates[:] = 10.0  # microvolts
+        self.thresholds = self.mad_estimates * self.beta
+        
+        # Ring buffers for MAD calculation (using deque for efficiency)
+        self.mad_buffer_size = int(0.1 * sample_rate)  # 100ms window
+        self.mad_buffers = [deque(maxlen=self.mad_buffer_size) for _ in range(n_channels)]
+        
+        # Fixed-point formats (Q7.15 for MAD as per patent)
+        if use_fixed_point:
+            self.mad_fixed = np.zeros(n_channels, dtype=np.int32)
+            self.threshold_fixed = np.zeros(n_channels, dtype=np.int32)
+    
+    def amplify(self, data):
+        """Apply amplification to the signal"""
+        return data * self.amplification_gain
+    
+    def bandpass_filter_channel(self, data, channel_idx):
+        """Apply bandpass filter to a single channel with state preservation"""
+        filtered, self.zi[channel_idx] = signal.sosfilt(
+            self.sos, data, zi=self.zi[channel_idx]
+        )
+        return filtered
+    
+    def update_mad(self, filtered_data, channel_idx):
+        """Update MAD estimate for adaptive thresholding"""
+        # Add new samples to buffer
+        self.mad_buffers[channel_idx].extend(filtered_data)
+        
+        if len(self.mad_buffers[channel_idx]) >= self.mad_buffer_size:
+            # Calculate median
+            buffer_array = np.array(self.mad_buffers[channel_idx])
+            median = np.median(buffer_array)
+            
+            # Calculate MAD
+            mad = np.median(np.abs(buffer_array - median))
+            
+            # Update MAD estimate using exponential smoothing
+            # m̂ = m + α(|x| - m) from patent
+            self.mad_estimates[channel_idx] = (
+                self.mad_estimates[channel_idx] + 
+                self.alpha * (mad - self.mad_estimates[channel_idx])
+            )
+            
+            # Update threshold: thres = βm
+            self.thresholds[channel_idx] = self.beta * self.mad_estimates[channel_idx]
+            
+            # Fixed-point conversion if enabled
+            if self.use_fixed_point:
+                # Q7.15 format as per patent
+                self.mad_fixed[channel_idx] = FixedPoint.to_fixed(
+                    self.mad_estimates[channel_idx], 7, 15
+                )
+                self.threshold_fixed[channel_idx] = FixedPoint.to_fixed(
+                    self.thresholds[channel_idx], 7, 15
+                )
+    
+    def process_chunk(self, data_chunk):
+        """Process a chunk of multi-channel data"""
+        # Ensure data is 2D (samples x channels)
+        if data_chunk.ndim == 1:
+            data_chunk = data_chunk.reshape(-1, 1)
+        
+        n_samples, n_channels = data_chunk.shape
+        
+        # Preallocate output
+        filtered_data = np.zeros_like(data_chunk)
+        
+        # Process each channel
+        for ch_idx in range(n_channels):
+            # 1. Amplification
+            amplified = self.amplify(data_chunk[:, ch_idx])
+            
+            # 2. Bandpass filtering
+            filtered = self.bandpass_filter_channel(amplified, ch_idx)
+            filtered_data[:, ch_idx] = filtered
+            
+            # 3. Update MAD for this channel
+            self.update_mad(filtered, ch_idx)
+        
+        return filtered_data
+    
+    def get_thresholds(self):
+        """Get current thresholds for all channels"""
+        if self.use_fixed_point:
+            # Convert from fixed-point
+            return np.array([
+                FixedPoint.from_fixed(t, 7, 15) 
+                for t in self.threshold_fixed
+            ])
+        return self.thresholds.copy()
+    
+    def get_mad_estimates(self):
+        """Get current MAD estimates for all channels"""
+        if self.use_fixed_point:
+            # Convert from fixed-point
+            return np.array([
+                FixedPoint.from_fixed(m, 7, 15) 
+                for m in self.mad_fixed
+            ])
+        return self.mad_estimates.copy()
+
+# Modified SpikeGLXReader class remains the same
 class SpikeGLXReader:
     """Read SpikeGLX binary files"""
     
@@ -58,8 +217,6 @@ class SpikeGLXReader:
     
     def _get_ap_channels(self):
         """Get AP band channel indices"""
-        # For IMEC probes, AP channels are typically 0 to 383
-        # This might vary based on your specific probe configuration
         saved_chans = self.meta.get('snsApLfSy', '384,0,1')
         ap_count = int(saved_chans.split(',')[0])
         return list(range(ap_count))
@@ -76,12 +233,7 @@ class SpikeGLXReader:
     
     def _get_uv_per_bit(self):
         """Calculate microvolts per bit for int16 to voltage conversion"""
-        # Get probe type specific gain
-        imro_table = self.meta.get('imroTbl', '')
-        
-        # Default values for different probe types
         if 'imec' in self.bin_path.name.lower():
-            # IMEC probe typical values
             max_int = 512
             v_range = 0.6  # 0.6V range typical for IMEC
         else:
@@ -93,27 +245,43 @@ class SpikeGLXReader:
     def get_data_chunk(self, start_sample, n_samples, channels=None):
         """Get a chunk of data"""
         if channels is None:
-            channels = self.ap_channels  # Default to AP channels
+            channels = self.ap_channels
         
         end_sample = min(start_sample + n_samples, self.n_samples)
-        data_chunk = self.data[start_sample:end_sample, channels]
+        
+        # Ensure channels is a list for proper indexing
+        if isinstance(channels, list):
+            data_chunk = self.data[start_sample:end_sample][:, channels]
+        else:
+            data_chunk = self.data[start_sample:end_sample, channels]
         
         # Convert to microvolts
         return data_chunk * self.uv_per_bit
 
-
+# Modified LSLStreamer with preprocessing
 class LSLStreamer:
-    """Stream SpikeGLX data via LSL"""
+    """Stream SpikeGLX data via LSL with preprocessing"""
     
-    def __init__(self, reader, chunk_size=1000, stream_name="SpikeGLX_Stream"):
+    def __init__(self, reader, chunk_size=1000, stream_name="SpikeGLX_Stream", 
+                 use_preprocessing=True, use_fixed_point=False, playback_speed=1.0):
         self.reader = reader
         self.chunk_size = chunk_size
         self.current_sample = 0
         self.is_streaming = False
+        self.playback_speed = playback_speed
+        self.use_preprocessing = use_preprocessing
         
-        # Select channels to stream (e.g., first 32 AP channels)
+        # Select channels to stream
         self.stream_channels = reader.ap_channels[:32]
         self.n_stream_channels = len(self.stream_channels)
+        
+        # Initialize preprocessing pipeline
+        if use_preprocessing:
+            self.preprocessor = PreprocessingPipeline(
+                sample_rate=reader.sample_rate,
+                n_channels=self.n_stream_channels,
+                use_fixed_point=use_fixed_point
+            )
         
         # Create LSL stream info
         info = StreamInfo(
@@ -138,6 +306,9 @@ class LSLStreamer:
         
         # Queue for visualization
         self.data_queue = queue.Queue(maxsize=10)
+        
+        # Queue for threshold monitoring
+        self.threshold_queue = queue.Queue(maxsize=10)
     
     def start_streaming(self):
         """Start streaming data"""
@@ -154,7 +325,7 @@ class LSLStreamer:
     def _stream_loop(self):
         """Main streaming loop"""
         samples_per_push = int(self.chunk_size)
-        sleep_time = samples_per_push / self.reader.sample_rate
+        sleep_time = samples_per_push / self.reader.sample_rate / self.playback_speed
         
         while self.is_streaming and self.current_sample < self.reader.n_samples:
             # Get data chunk
@@ -164,11 +335,31 @@ class LSLStreamer:
                 self.stream_channels
             )
             
-            # Push to LSL
-            for sample in data:
-                self.outlet.push_sample(sample.astype(np.float32))
+            # Apply preprocessing if enabled
+            if self.use_preprocessing:
+                data = self.preprocessor.process_chunk(data)
+                
+                # Periodically update threshold information
+                if self.current_sample % (self.reader.sample_rate // 10) == 0:  # 10Hz update
+                    try:
+                        self.threshold_queue.put_nowait({
+                            'thresholds': self.preprocessor.get_thresholds(),
+                            'mad_estimates': self.preprocessor.get_mad_estimates()
+                        })
+                    except queue.Full:
+                        pass
             
-            # Put data in queue for visualization (don't block)
+            # Push to LSL with adjusted timestamps if needed
+            if self.playback_speed != 1.0:
+                timestamp = time.time()
+                for i in range(len(data)):
+                    sample_offset = i / self.reader.sample_rate / self.playback_speed
+                    self.outlet.push_sample(data[i].astype(np.float32), timestamp + sample_offset)
+            else:
+                for i in range(len(data)):
+                    self.outlet.push_sample(data[i].astype(np.float32))
+            
+            # Put data in queue for visualization
             try:
                 self.data_queue.put_nowait(data)
             except queue.Full:
@@ -177,16 +368,17 @@ class LSLStreamer:
             # Update position
             self.current_sample += len(data)
             
-            # Sleep to maintain real-time streaming
+            # Sleep to maintain desired playback speed
             time.sleep(sleep_time)
         
         print(f"Streaming finished. Total samples streamed: {self.current_sample}")
 
-
+# Enhanced visualizer with threshold display
+# Enhanced visualizer with threshold display (fixed version)
 class StreamVisualizer:
-    """Visualize the LSL stream"""
+    """Visualize the LSL stream with threshold information"""
     
-    def __init__(self, streamer, display_seconds=5, update_interval=100):
+    def __init__(self, streamer, display_seconds=0.01, update_interval=100):
         self.streamer = streamer
         self.display_seconds = display_seconds
         self.update_interval = update_interval
@@ -198,18 +390,36 @@ class StreamVisualizer:
         self.buffers = [deque(maxlen=self.buffer_size) 
                        for _ in range(streamer.n_stream_channels)]
         
-        # Setup plot
-        self.fig, self.axes = plt.subplots(
-            min(8, streamer.n_stream_channels), 1, 
-            figsize=(12, 8), 
-            sharex=True
-        )
+        # Setup plot with additional threshold subplot
+        n_display_channels = min(8, streamer.n_stream_channels)
         
-        if streamer.n_stream_channels == 1:
-            self.axes = [self.axes]
+        if streamer.use_preprocessing:
+            self.fig = plt.figure(figsize=(14, 10))
+            gs = self.fig.add_gridspec(n_display_channels + 1, 2, 
+                                      width_ratios=[3, 1], 
+                                      height_ratios=[1]*n_display_channels + [0.5])
+            
+            # Signal plots
+            self.axes = []
+            for i in range(n_display_channels):
+                ax = self.fig.add_subplot(gs[i, 0])
+                self.axes.append(ax)
+            
+            # Threshold plot
+            self.threshold_ax = self.fig.add_subplot(gs[:, 1])
+        else:
+            self.fig, self.axes = plt.subplots(
+                n_display_channels, 1, 
+                figsize=(12, 8), 
+                sharex=True
+            )
+            if n_display_channels == 1:
+                self.axes = [self.axes]
         
         # Initialize lines
         self.lines = []
+        self.threshold_lines = []
+        self.neg_threshold_lines = []  # Initialize this list here!
         time_array = np.linspace(0, display_seconds, self.buffer_size)
         
         for i, ax in enumerate(self.axes):
@@ -218,10 +428,43 @@ class StreamVisualizer:
             ax.set_ylabel(f'Ch {self.streamer.stream_channels[i]}')
             ax.set_ylim(-200, 200)  # microvolts
             ax.grid(True, alpha=0.3)
+            
+            # Add threshold lines if preprocessing is enabled
+            if self.streamer.use_preprocessing:
+                # Positive threshold line
+                thresh_line = ax.axhline(y=0, color='r', linestyle='--', alpha=0.5)
+                self.threshold_lines.append(thresh_line)
+                
+                # Negative threshold line
+                neg_thresh_line = ax.axhline(y=0, color='r', linestyle='--', alpha=0.5)
+                self.neg_threshold_lines.append(neg_thresh_line)
         
         self.axes[-1].set_xlabel('Time (s)')
-        self.fig.suptitle('SpikeGLX LSL Stream')
+        self.fig.suptitle('SpikeGLX LSL Stream with Preprocessing')
         
+        # Setup threshold bar plot
+        if self.streamer.use_preprocessing:
+            self.threshold_bars = None
+            self.mad_bars = None
+            self._setup_threshold_plot()
+    
+    def _setup_threshold_plot(self):
+        """Setup the threshold visualization plot"""
+        self.threshold_ax.clear()
+        channels = range(min(8, self.streamer.n_stream_channels))
+        x = np.arange(len(channels))
+        
+        self.threshold_bars = self.threshold_ax.bar(x - 0.2, np.zeros(len(channels)), 
+                                                   0.4, label='Threshold', alpha=0.7)
+        self.mad_bars = self.threshold_ax.bar(x + 0.2, np.zeros(len(channels)), 
+                                             0.4, label='MAD', alpha=0.7)
+        
+        self.threshold_ax.set_xlabel('Channel')
+        self.threshold_ax.set_ylabel('µV')
+        self.threshold_ax.set_title('Adaptive Thresholds')
+        self.threshold_ax.legend()
+        self.threshold_ax.grid(True, alpha=0.3)
+    
     def update_plot(self, frame):
         """Update plot with new data"""
         # Get all available data from queue
@@ -257,6 +500,35 @@ class StreamVisualizer:
                         margin = (y_max - y_min) * 0.1
                         self.axes[i].set_ylim(y_min - margin, y_max + margin)
         
+        # Update threshold visualization if preprocessing is enabled
+        if self.streamer.use_preprocessing:
+            try:
+                threshold_info = self.streamer.threshold_queue.get_nowait()
+                thresholds = threshold_info['thresholds']
+                mad_estimates = threshold_info['mad_estimates']
+                
+                # Update threshold lines on signal plots
+                for i in range(min(len(thresholds), len(self.threshold_lines))):
+                    thresh = thresholds[i]
+                    
+                    # Update positive threshold line
+                    self.threshold_lines[i].set_ydata([thresh, thresh])
+                    
+                    # Update negative threshold line
+                    self.neg_threshold_lines[i].set_ydata([-thresh, -thresh])
+                
+                # Update bar plots
+                n_channels = min(8, len(thresholds))
+                for i in range(n_channels):
+                    self.threshold_bars[i].set_height(thresholds[i])
+                    self.mad_bars[i].set_height(mad_estimates[i])
+                
+                self.threshold_ax.relim()
+                self.threshold_ax.autoscale_view()
+                
+            except queue.Empty:
+                pass
+        
         return self.lines
     
     def start(self):
@@ -264,16 +536,21 @@ class StreamVisualizer:
         self.ani = FuncAnimation(
             self.fig, self.update_plot, 
             interval=self.update_interval,
-            blit=True, cache_frame_data=False
+            blit=False, cache_frame_data=False
         )
+        plt.tight_layout()
         plt.show()
 
-
 def main():
-    """Main function to run the LSL streamer"""
+    """Main function to run the LSL streamer with preprocessing"""
     
     # Path to your .cbin file
     cbin_path = "/home/riwata/Documents/projects/leadboss/data/44729857_unzipped/sim.imec0.ap.cbin"
+    
+    # Configuration options
+    use_preprocessing = True  # Enable/disable preprocessing
+    use_fixed_point = False   # Enable/disable fixed-point arithmetic
+    playback_speed = 0.01      # Playback speed multiplier
     
     try:
         # Initialize reader
@@ -286,9 +563,25 @@ def main():
         print(f"  Duration: {reader.n_samples / reader.sample_rate:.2f} seconds")
         print(f"  AP channels: {len(reader.ap_channels)}")
         
-        # Create streamer
-        streamer = LSLStreamer(reader, chunk_size=1000)
+        # Create streamer with preprocessing
+        streamer = LSLStreamer(
+            reader, 
+            chunk_size=1000, 
+            use_preprocessing=use_preprocessing,
+            use_fixed_point=use_fixed_point,
+            playback_speed=playback_speed
+        )
+        
         print(f"\nStreaming {streamer.n_stream_channels} channels via LSL...")
+        print(f"Preprocessing: {'Enabled' if use_preprocessing else 'Disabled'}")
+        print(f"Fixed-point arithmetic: {'Enabled' if use_fixed_point else 'Disabled'}")
+        print(f"Playback speed: {playback_speed}x")
+        
+        if use_preprocessing:
+            print("\nPreprocessing pipeline:")
+            print(f"  - Amplification: {streamer.preprocessor.amplification_gain}x")
+            print(f"  - Bandpass filter: {streamer.preprocessor.bp_low}-{streamer.preprocessor.bp_high} Hz")
+            print(f"  - MAD threshold: {streamer.preprocessor.beta}x MAD")
         
         # Start streaming
         streamer.start_streaming()
@@ -309,7 +602,6 @@ def main():
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
-
 
 if __name__ == "__main__":
     main()
